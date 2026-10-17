@@ -1,0 +1,351 @@
+// Invoice Automation demo CRM. The CRM is the single source of truth:
+// every invoice state and every processing step lives here.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Admin {
+  id                Int      @id @default(autoincrement())
+  name              String
+  email             String   @unique
+  passwordHash      String
+  // Where escalations and failure alerts are emailed (Settings page);
+  // falls back to ADMIN_ALERT_EMAIL, then to the login email.
+  notificationEmail String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@map("admins")
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  BOTH // email and SMS
+}
+
+model Client {
+  id                 Int                 @id @default(autoincrement())
+  name               String
+  email              String
+  phone              String
+  addressLine1       String
+  addressLine2       String?
+  city               String
+  province           String // province/state code, e.g. QC, ON
+  postalCode         String
+  country            String              @default("CA") // ISO-3166 alpha-2
+  timezone           String // IANA, e.g. America/Toronto
+  preferredChannel   NotificationChannel @default(EMAIL)
+  smsConsent         Boolean             @default(false)
+  smsConsentAt       DateTime?
+  isActive           Boolean             @default(true)
+  // Billing plan, set on the client form: what the client is billed and
+  // when. ONE_TIME bills once on billingDate; MONTHLY bills on billingDate
+  // and then on the same day every month.
+  billingType        BillingPlanType     @default(NONE)
+  billingDescription String?
+  billingAmount      Decimal?            @db.Decimal(12, 2) // before tax
+  billingDate        DateTime?           @db.Date
+  billingTermsDays   Int?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  invoices       Invoice[]
+  recurringRules RecurringRule[]
+
+  @@index([isActive])
+  @@map("clients")
+}
+
+enum BillingPlanType {
+  NONE
+  ONE_TIME
+  MONTHLY
+}
+
+enum InvoiceType {
+  ONE_TIME
+  RECURRING
+}
+
+enum InvoiceStatus {
+  PENDING
+  PROCESSING
+  CREATED
+  SENT
+  PAID
+  FAILED
+  CANCELLED
+}
+
+enum ErrorType {
+  RETRYABLE
+  PERMANENT
+}
+
+// Demo-only switch so a presenter can show a retryable gateway failure:
+// TIMEOUT fails the first attempt only, so a retry then succeeds.
+// Permanent failures come from real data checks (e.g. an invalid email).
+enum SimulatedFailure {
+  NONE
+  TIMEOUT
+}
+
+model Invoice {
+  id                  Int              @id @default(autoincrement())
+  invoiceNumber       String           @unique
+  clientId            Int
+  currency            String           @default("CAD")
+  subtotal            Decimal          @db.Decimal(12, 2)
+  taxTotal            Decimal          @db.Decimal(12, 2)
+  total               Decimal          @db.Decimal(12, 2)
+  issueAt             DateTime // UTC
+  dueAt               DateTime // UTC
+  paymentTerms        String // e.g. "Net 30"
+  type                InvoiceType      @default(ONE_TIME)
+  status              InvoiceStatus    @default(PENDING)
+  retryCount          Int              @default(0)
+  lastError           String?
+  errorType           ErrorType?
+  nextRetryAt         DateTime?
+  processingStartedAt DateTime?
+  gatewayInvoiceId    String?          @unique
+  simulateFailure     SimulatedFailure @default(NONE)
+  recurringRuleId     Int?
+  parentInvoiceId     Int?             @unique // the occurrence this one was generated from
+  fromClientPlan      Boolean          @default(false) // generated from the client's billing plan
+  sentAt              DateTime? // set when the automation reports SENT
+  paidAt              DateTime? // set when the invoice becomes PAID
+  reminderCount       Int              @default(0) // overdue reminders sent so far
+  lastReminderAt      DateTime?
+  agentSessionId      String? // Managed Agent session that handles this invoice's emails
+  needsAttention      Boolean          @default(false) // set when the agent escalates to the admin
+  escalatedAt         DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  client        Client            @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  lineItems     InvoiceLineItem[]
+  taxes         InvoiceTax[]
+  auditLogs     AuditLog[]
+  emails        EmailMessage[]
+  agentTasks    AgentTask[]
+  recurringRule RecurringRule?    @relation(fields: [recurringRuleId], references: [id], onDelete: SetNull)
+  parent        Invoice?          @relation("Occurrence", fields: [parentInvoiceId], references: [id], onDelete: SetNull)
+  next          Invoice?          @relation("Occurrence")
+
+  @@index([status, dueAt])
+  @@index([clientId])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id          Int     @id @default(autoincrement())
+  invoiceId   Int
+  description String
+  quantity    Decimal @db.Decimal(10, 2)
+  unitPrice   Decimal @db.Decimal(12, 2)
+  lineTotal   Decimal @db.Decimal(12, 2)
+  position    Int     @default(0)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("invoice_line_items")
+}
+
+model InvoiceTax {
+  id        Int     @id @default(autoincrement())
+  invoiceId Int
+  name      String // GST, QST, HST
+  rate      Decimal @db.Decimal(6, 3) // percent, e.g. 9.975
+  amount    Decimal @db.Decimal(12, 2)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("invoice_taxes")
+}
+
+enum RecurrenceFrequency {
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+model RecurringRule {
+  id              Int                 @id @default(autoincrement())
+  clientId        Int
+  frequency       RecurrenceFrequency
+  startDate       DateTime
+  endDate         DateTime?
+  occurrenceCount Int? // stop after this many invoices; no endDate and no count = open-ended
+  generatedCount  Int                 @default(0)
+  fromClientPlan  Boolean             @default(false) // created from the client's billing plan
+  stoppedAt       DateTime? // plan replaced or stopped: no further occurrences
+  createdAt       DateTime            @default(now())
+
+  client   Client    @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  invoices Invoice[]
+
+  @@map("recurring_rules")
+}
+
+enum AuditStep {
+  CLAIM
+  GATEWAY_CREATE
+  STATUS_UPDATE
+  RETRY
+  GENERATE_NOW
+  MANUAL_STATUS
+  RECURRING_NEXT
+  API_LOG
+  INVOICE_CREATE
+  REMINDER
+  PAYMENT_WEBHOOK
+  EMAIL_SENT
+  CLIENT_REPLY
+  ESCALATION
+  AGENT_TASK
+}
+
+enum AuditResult {
+  SUCCESS
+  FAILURE
+}
+
+// Append-only: rows are never updated or deleted by the app.
+model AuditLog {
+  id        Int         @id @default(autoincrement())
+  invoiceId Int
+  step      AuditStep
+  result    AuditResult
+  message   String
+  metadata  Json?
+  actor     String // "system", "api" or "admin:<id>"
+  createdAt DateTime    @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, createdAt])
+  @@map("audit_logs")
+}
+
+// Stand-in for the payment gateway. The CRM invoice id is the idempotency
+// key, so creating the same invoice twice returns the first gateway id.
+model MockGatewayInvoice {
+  id             Int      @id @default(autoincrement())
+  idempotencyKey String   @unique
+  gatewayId      String   @unique
+  amount         Decimal  @db.Decimal(12, 2)
+  currency       String
+  createdAt      DateTime @default(now())
+
+  @@map("mock_gateway_invoices")
+}
+
+// Payment webhooks received, keyed on the provider's event id, so a
+// delivery the provider repeats is applied only once.
+model WebhookEvent {
+  id        Int      @id @default(autoincrement())
+  eventId   String   @unique
+  type      String
+  invoiceId Int?
+  payload   Json
+  createdAt DateTime @default(now())
+
+  @@map("webhook_events")
+}
+
+enum EmailDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum EmailKind {
+  INVOICE
+  RECEIPT
+  REMINDER
+  REPLY
+  ESCALATION // to the admin
+  ALERT // processing failure, to the admin
+  CLIENT_MESSAGE // inbound, from the client
+}
+
+enum EmailDelivery {
+  OUTBOX // stored only (no email provider configured)
+  SENT // handed to the provider
+  FAILED
+  RECEIVED // inbound
+}
+
+// Every email the CRM sends or receives for an invoice. With no provider
+// configured the row is the email (mock outbox).
+model EmailMessage {
+  id          Int            @id @default(autoincrement())
+  invoiceId   Int
+  direction   EmailDirection
+  kind        EmailKind
+  toAddress   String
+  fromAddress String
+  subject     String
+  body        String // plain-text version
+  html        String? // designed HTML version (outbound)
+  delivery    EmailDelivery
+  deliveredTo String? // actual recipient when EMAIL_TEST_RECIPIENT redirects it
+  providerId  String?
+  error       String?
+  createdAt   DateTime       @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, createdAt])
+  @@map("email_messages")
+}
+
+enum AgentTaskType {
+  INVOICE_EMAIL
+  RECEIPT_EMAIL
+  REMINDER_EMAIL
+  CLIENT_REPLY
+  ADMIN_ALERT // sent by code, not the agent
+}
+
+enum AgentTaskStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+// Work for the agent runner. dedupeKey makes enqueueing idempotent
+// (e.g. "invoice-email:12"), so a repeated event never queues twice.
+model AgentTask {
+  id         Int             @id @default(autoincrement())
+  type       AgentTaskType
+  invoiceId  Int
+  dedupeKey  String          @unique
+  payload    Json?
+  status     AgentTaskStatus @default(PENDING)
+  attempts   Int             @default(0)
+  result     String?
+  lastError  String?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([invoiceId])
+  @@map("agent_tasks")
+}

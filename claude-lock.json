@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "origin": {
+    "base_url": "https://api.anthropic.com",
+    "organization_id": "8f651486-c5d9-4979-9ad9-578e73c292c4",
+    "workspace_id": "wrkspc_01Fi23QjJyQfPTFU5vtSSsYE"
+  },
+  "resources": {
+    "./agents/invoice-agent.md": {
+      "kind": "agent",
+      "id": "agent_018B8abxHwjFLPQBvUsz2NYC",
+      "version": "2",
+      "hash": "5b9ffe70727663c5b346884186fac9df",
+      "remote_hash": "1b9c9a783e0f64dfb9720addb4f157e5"
+    },
+    "./environments/invoice-agent.yaml": {
+      "kind": "environment",
+      "id": "env_015oQUzCCbNhdNkU31CVgVXN",
+      "hash": "ca14197edb968c1dfdb43d529aea04dc",
+      "remote_hash": "d8a1fc1ba06ec72ade9146d4fedf5188"
+    }
+  }
+}
